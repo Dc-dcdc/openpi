@@ -140,7 +140,7 @@ class Observation(Generic[ArrayT]):
 # produced by the data transforms.
 Actions = at.Float[ArrayT, "*b ah ad"]
 
-
+# 统一图像尺寸，训练时进行随机图像增强，并补齐图像有效性掩码，最后返回新的观测对象
 def preprocess_observation(
     rng: at.KeyArrayLike | None,
     observation: Observation,
@@ -161,27 +161,27 @@ def preprocess_observation(
     out_images = {}
     for key in image_keys:
         image = observation.images[key]
-        if image.shape[1:3] != image_resolution:
+        if image.shape[1:3] != image_resolution:  # 如果尺寸与目标尺寸不同，就使用保持宽高比的缩放和填充调整图像。默认目标尺寸为 224 × 224
             logger.info(f"Resizing image {key} from {image.shape[1:3]} to {image_resolution}")
-            image = image_tools.resize_with_pad(image, *image_resolution)
+            image = image_tools.resize_with_pad(image, *image_resolution)  # 统一图像尺寸
 
         if train:
             # Convert from [-1, 1] to [0, 1] for augmax.
             image = image / 2.0 + 0.5
 
             transforms = []
-            if "wrist" not in key:
+            if "wrist" not in key: #腕部图像跳过了随机裁剪和旋转，仍然进行颜色增强。
                 height, width = image.shape[1:3]
                 transforms += [
-                    augmax.RandomCrop(int(width * 0.95), int(height * 0.95)),
-                    augmax.Resize(width, height),
-                    augmax.Rotate((-5, 5)),
+                    augmax.RandomCrop(int(width * 0.95), int(height * 0.95)),  # 随机裁剪，保留约 95% 的宽和高
+                    augmax.Resize(width, height),                              # 调整图像大小回原始尺寸
+                    augmax.Rotate((-5, 5)),                                    # 随机旋转，角度范围为 -5 到 5 度
                 ]
             transforms += [
-                augmax.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5),
+                augmax.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5),  # 颜色抖动，调整亮度、对比度和饱和度
             ]
             sub_rngs = jax.random.split(rng, image.shape[0])
-            image = jax.vmap(augmax.Chain(*transforms))(sub_rngs, image)
+            image = jax.vmap(augmax.Chain(*transforms))(sub_rngs, image) # 对每个图像应用数据增强包括随机裁剪、旋转和颜色抖动等操作
 
             # Back to [-1, 1].
             image = image * 2.0 - 1.0
@@ -191,7 +191,8 @@ def preprocess_observation(
     # obtain mask
     out_masks = {}
     for key in out_images:
-        if key not in observation.image_masks:
+        # 补齐图像有效性掩码
+        if key not in observation.image_masks: 
             # do not mask by default
             out_masks[key] = jnp.ones(batch_shape, dtype=jnp.bool)
         else:
@@ -269,7 +270,7 @@ class BaseModel(nnx.Module, abc.ABC):
     action_horizon: int
     max_token_len: int
 
-    @abc.abstractmethod
+    @abc.abstractmethod  # 父类规定：具体子类必须实现这个接口
     def compute_loss(
         self,
         rng: at.KeyArrayLike,

@@ -22,8 +22,8 @@ class Pi0Config(_model.BaseModelConfig):
     action_expert_variant: _gemma.Variant = "gemma_300m"
 
     # Set the model specific defaults.
-    action_dim: int = 32
-    action_horizon: int = 50
+    action_dim: int = 32     # 动作维度，不足就补0
+    action_horizon: int = 50  # 预测的动作序列长度
     max_token_len: int = None  # type: ignore
     # Pi05 has two differences from Pi0:
     # - the state input is part of the discrete language tokens rather than a continuous input that is part of the suffix
@@ -47,8 +47,8 @@ class Pi0Config(_model.BaseModelConfig):
                 "max-autotune-no-cudagraphs",
             ]
 
-    @property
-    @override
+    @property  # 将方法包装为属性，通过 对象.属性 访问   允许通过 config.model_type 读取模型类型
+    @override  # 重写了父类接口
     def model_type(self) -> _model.ModelType:
         if self.pi05:
             return _model.ModelType.PI05
