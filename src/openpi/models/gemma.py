@@ -69,12 +69,12 @@ def get_config(variant: Variant) -> Config:
     if variant == "gemma_300m": # 动作专家   约3亿参数
         # 311M params
         return Config(
-            width=1024,
-            depth=18,
-            mlp_dim=4096,
-            num_heads=8,
-            num_kv_heads=1,
-            head_dim=256,
+            width=1024,       # token 的特征宽度，Block 输入与输出均为 1024 维
+            depth=18,         # Transformer Block 的层数
+            mlp_dim=4096,    # FFN 升维后的中间特征宽度
+            num_heads=8,     # Query 头数
+            num_kv_heads=1,  # Key、Value 各有 1 个头，由 8 个 Query 头共享
+            head_dim=256,    # 每个 Q、K、V 头的特征维度
         )
     if variant == "gemma_2b": # VLM   约20亿参数
         return Config(
@@ -396,7 +396,40 @@ class FeedForward(nn.Module):
         return outputs  # 返回 FFN 结果，形状与输入相同。
 
 
-
+'''
+输入 X
+  │
+  ├─────────────────────── 残差支路 ──┐
+  ↓                                  │
+RMSNorm                              │
+  ↓                                  │
+联合 Attention                       │
+  ├─ 两分支分别投影 Q、K、V            │
+  ├─ Q、K 应用 RoPE                  │
+  ├─ 读取可选 KV 缓存                 │
+  ├─ 缩放点积 → 掩码 → softmax        │
+  ├─ 加权汇总 V                      │
+  └─ 两分支分别做输出投影              │
+  ↓                                 │
+Dropout（默认关闭）                   │
+  ↓                                 │
+加上原始输入 X ←─────────────────────┘
+  │
+  ├─────────────────────── 残差支路 ──┐
+  ↓                                  │
+RMSNorm                              │
+  ↓                                  │
+各分支独立的门控 FFN                    │
+  ├─ 两路升维                          │
+  ├─ 一路 GELU → 两路逐元素相乘         │
+  └─ 降维                             │
+  ↓                                  │
+Dropout（默认关闭）                    │
+  ↓                                  │
+加上 FFN 子层之前的输入 ←───────────────┘
+  ↓
+本层输出
+'''
 @at.typecheck
 class Block(nn.Module):
     """Transformer block."""
@@ -431,8 +464,7 @@ class Block(nn.Module):
         pre_attn = []
         # 保存注意力子层对应的残差 gate。
         gates = []
-        # 按分支依次处理：i=0 为 VLM，i=1 为动作专家；不是循环处理注意力头。
-        for i, x in enumerate(xs):
+        for i, x in enumerate(xs): # 按分支依次处理：i=0 为 VLM，i=1 为动作专家
             if x is not None:
                 # 使用该分支自己的注意力前归一化；普通 RMSNorm 返回 gate=None。
                 # 条件分支还返回残差 gate，供 Attention 输出后的残差连接使用。
@@ -452,8 +484,7 @@ class Block(nn.Module):
         # 为注意力子层输出设置分片约束。
         post_attn = sharding.activation_sharding_constraint(post_attn)
         # 第一次残差：普通 π₀ 为 原输入 + Attention 输出；有 gate 时为 原输入 + gate × 输出。
-        # strict=True 要求三个列表长度一致；_gated_residual 会保留未计算分支的 None。
-        xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, post_attn, gates, strict=True)]
+        xs = [_gated_residual(x, y, gate) for x, y, gate in zip(xs, post_attn, gates, strict=True)]# strict=True 要求三个列表长度一致；_gated_residual 会保留未计算分支的 None。
         # 施加激活张量的分片约束，用于设备间的数据布局，不改变这里的数学计算。
         xs = sharding.activation_sharding_constraint(xs)
 
@@ -510,32 +541,42 @@ Pi0	            组织完整模型，并实现训练损失和动作采样
 class Module(nn.Module):
     """Transformer model, supporting a mixture of different weights for different tokens."""
 
+    # 联合 Transformer 的分支配置；π₀ 中分别对应 VLM 和动作专家。
     configs: Sequence[Config]  # list of configs, one for each expert
+    # 嵌入及层间特征使用的数据类型。
     embed_dtype: str
 
     dropout: float = 0.0
     dropout_bdims: tuple[int, ...] = ()  # Every float is dropped independently.
     adarms: bool = False
 
+    # 建立词嵌入、多层 Block 和各分支的最终归一化。
     def setup(self):
         # all experts must have the same depth
+        # 两分支在每一层联合计算，因此要求层数相同。
         assert all(config.depth == self.configs[0].depth for config in self.configs)
 
+        # 语言 token 嵌入使用第一个分支（VLM）的特征宽度。
         self.embedder = Embedder(
             vocab_size=PALIGEMMA_VOCAB_SIZE,
             embed_dim=self.configs[0].width,  # embedder for first expert only
             name="embedder",
         )
+        # 梯度检查点：反向传播时重算部分中间结果，以计算换显存。
         block_cls = nn.remat(
             Block,
             prevent_cse=False,
             static_argnums=(5,),  # 0=self, 6=deterministic
             policy=jax.checkpoint_policies.nothing_saveable,
         )
+        # 按层扫描 Block：特征依次传入下一层，默认共 18 层。
         self.layers = nn.scan(
             block_cls,
+            # 参数沿层轴存储；各层有独立权重，并非所有层共享参数。
             variable_axes={"params": 0},
+            # 为不同层拆分参数初始化及 dropout 的随机密钥。
             split_rngs={"params": True, "dropout": True},
+            # KV 缓存沿第 0 维逐层取用；位置、掩码、条件等参数在各层复用。
             in_axes=(
                 0,
                 nn.broadcast,
@@ -549,40 +590,52 @@ class Module(nn.Module):
             dropout=self.dropout,
             dropout_bdims=self.dropout_bdims,
         )
+        # 所有 Block 之后，每个分支再使用各自的最终 RMSNorm。
         self.final_norms = [RMSNorm(name=_name("final_norm", i)) for i in range(len(self.configs))]
 
     @at.typecheck
     def embed(self, tokens: at.Int[at.Array, "b t"]) -> at.Float[at.Array, "b t d"]:
+        # 语言 ID [B, T] → 特征 [B, T, D]，并转换为指定类型。
         return self.embedder.encode(tokens).astype(self.embed_dtype)
 
     @at.typecheck
     def __call__(
         self,
         # list of token arrays, one for each expert, or None if that expert should not be run
+        # 输入已嵌入的分支特征；None 表示本次跳过该分支（例如已有前缀缓存）。
         embedded: Sequence[at.Float[at.Array, "b _t _d"] | None],
         positions: at.Int[at.Array, "b t"],
         mask: at.Bool[at.Array, "b t s"],
         adarms_cond: Sequence[at.Float[at.Array, "b _d"] | None] | None = None,
         *,
+        # 可选的各层 K/V 缓存；推理时用于复用图文前缀。
         kv_cache: KVCache | None = None,
         deterministic: bool = True,
     ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
+        # 统一各有效分支的计算类型，保留 None 分支。
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
+        # 掩码 [B, T, S] → [B, 1, T, S]，增加用于头维广播的轴。
         mask = jnp.asarray(mask)[:, None, :, :]
+        # 未提供自适应条件时，各分支均使用普通 RMSNorm。
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
+        # 依次执行所有 Block，得到最终特征和各层返回的 K/V。
         embedded, kv_cache = self.layers(embedded, kv_cache, positions, mask, adarms_cond, deterministic)
 
+        # 检查有效分支的输出数据类型。
         assert all(e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None)
 
+        # 对各分支做最终归一化，只取特征结果；同时返回 KV 缓存。
         return [
             f(e, a)[0] if e is not None else e for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
         ], kv_cache
 
     def init(self, use_adarms: Sequence[bool]):
         """Convenience method for initializing all parameters, necessary due to the quirks of linen."""
+        # 用最小虚拟输入触发词嵌入参数初始化。
         self.embed(jnp.zeros((1, 1), dtype=jnp.int32))
+        # 再运行所有分支以建立其参数；use_adarms 决定初始化普通或条件归一化。
         self(
             [jnp.zeros((1, 1, c.width)) for c in self.configs],
             jnp.zeros((1, len(self.configs)), dtype=jnp.int32),

@@ -107,14 +107,14 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
-        paligemma_config = _gemma.get_config(config.paligemma_variant)
-        action_expert_config = _gemma.get_config(config.action_expert_variant)
+        paligemma_config = _gemma.get_config(config.paligemma_variant)    # 获取 VLM 结构配置    
+        action_expert_config = _gemma.get_config(config.action_expert_variant)  # 获取动作专家结构配置
         # TODO: rewrite gemma in NNX. For now, use bridge.
         llm = nnx_bridge.ToNNX(
             _gemma.Module(
-                configs=[paligemma_config, action_expert_config],
-                embed_dtype=config.dtype,
-                adarms=config.pi05,
+                configs=[paligemma_config, action_expert_config], # 分别传入 VLM 和动作专家的配置
+                embed_dtype=config.dtype,  # 嵌入特征的数据类型
+                adarms=config.pi05,   # 是否启用 π₀.₅ 条件调制
             )
         )
         llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False])
