@@ -126,7 +126,7 @@ class FakeDataset(Dataset):
     def __len__(self) -> int:
         return self._num_samples
 
-
+# 读取 LeRobot 数据集，将当前观测与从当前时刻开始的动作序列对应起来
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -137,13 +137,13 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id) # 根据 repo_id 获取数据集元信息，包括 fps、任务列表等。
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
-    )
+    ) # 创建 LeRobotDataset 实例，指定数据集 ID 和动作序列的时间戳增量（根据 fps 计算每个动作的时间间隔）。
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
@@ -221,13 +221,13 @@ def transform_iterable_dataset(
 
 
 def create_data_loader(
-    config: _config.TrainConfig,
+    config: _config.TrainConfig,  # 训练配置，包含数据、模型、批量大小等设置。
     *,
-    sharding: jax.sharding.Sharding | None = None,
-    shuffle: bool = False,
-    num_batches: int | None = None,
-    skip_norm_stats: bool = False,
-    framework: Literal["jax", "pytorch"] = "jax",
+    sharding: jax.sharding.Sharding | None = None,  # JAX 数据分片方式。
+    shuffle: bool = False,  # 是否打乱数据顺序。
+    num_batches: int | None = None,  # 限制返回的批次数；None 表示不设批次数上限。
+    skip_norm_stats: bool = False,  # 是否跳过数据归一化。
+    framework: Literal["jax", "pytorch"] = "jax",  # 指定训练框架及相应的张量处理方式。
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -239,20 +239,24 @@ def create_data_loader(
         skip_norm_stats: Whether to skip data normalization.
         framework: The framework to use ("jax" or "pytorch").
     """
+    # 通过数据配置工厂，结合资源目录和模型配置生成数据处理配置。
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
 
+    # 指定 RLDS 数据目录时走 RLDS 加载分支，当前主要用于 DROID 数据集。
     if data_config.rlds_data_dir is not None:
         return create_rlds_data_loader(
             data_config,
-            action_horizon=config.model.action_horizon,
-            batch_size=config.batch_size,
+            action_horizon=config.model.action_horizon,  # 每个样本包含的动作序列长度。
+            batch_size=config.batch_size,  # 传入配置中的全局批量大小。
             sharding=sharding,
             shuffle=shuffle,
             num_batches=num_batches,
             skip_norm_stats=skip_norm_stats,
             framework=framework,
         )
+    # 否则使用基于 PyTorch DataLoader 的加载分支，支持为 JAX 或 PyTorch 训练供数。
+    # 返回可迭代的加载器，每批数据为 (Observation, Actions)。
     return create_torch_data_loader(
         data_config,
         model_config=config.model,
@@ -261,8 +265,8 @@ def create_data_loader(
         sharding=sharding,
         shuffle=shuffle,
         num_batches=num_batches,
-        num_workers=config.num_workers,
-        seed=config.seed,
+        num_workers=config.num_workers,  # 数据加载工作进程数。
+        seed=config.seed,  # 数据加载器使用的随机种子。
         skip_norm_stats=skip_norm_stats,
         framework=framework,
     )
@@ -299,41 +303,92 @@ def create_torch_data_loader(
             execute in the main process.
         seed: The seed to use for shuffling the data.
     """
-    dataset = create_torch_dataset(data_config, action_horizon, model_config)
-    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    
+    '''
+    例如：
+    样本字典
+    ├── image          [3, 256, 256]  主视角图像（尺寸仅为示例）
+    ├── wrist_image    [3, 256, 256]  腕部图像
+    ├── state          [8]           当前机器人状态
+    ├── actions        [50, 7]       50 步真实动作，每步 7 维
+    └── task_index                   任务编号
+    '''
+    dataset = create_torch_dataset(data_config, action_horizon, model_config)# 读取 LeRobot 数据集，并按 action_horizon 组织每个样本的动作序列。
+    
+    
+    '''
+    # 包装数据变换：字段重组 → 机器人专用处理 → 归一化 → 模型专用处理。
+    字段重组:统一字典中的字段名称，让数据集提供的数据符合后续代码读取数据时使用的名字。例如：image → observation/image；只调整字段组织，不改变数据数值。
+    机器人专用处理：将不同机器人平台的数据适配为统一输入格式。例如：统一相机名称与图像格式、补齐缺失视角并设置有效掩码；
+    模型专用处理：根据模型类型整理输入，例如将图像调整为 224×224、将语言指令转换为 token ID 和有效掩码，并按规定长度填充或截断。
 
-    # Use TorchDataLoader for both frameworks
-    # For PyTorch DDP, create DistributedSampler and divide batch size by world size
-    # For JAX, divide by process count
-    sampler = None
+    处理后，单个样本成为：
+    样本字典
+    ├── image
+    │   ├── base_0_rgb          [224, 224, 3]
+    │   ├── left_wrist_0_rgb    [224, 224, 3]
+    │   └── right_wrist_0_rgb   [224, 224, 3]  缺失视角用零图补齐
+    ├── image_mask
+    │   ├── base_0_rgb          True
+    │   ├── left_wrist_0_rgb    True
+    │   └── right_wrist_0_rgb   False
+    ├── state                  [32]          原 8 维，其余补零
+    ├── actions                [50, 32]      原 7 维，其余补零
+    ├── tokenized_prompt       [48]          指令 token ID
+    └── tokenized_prompt_mask  [48]          有效 token 掩码
+    '''
+    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats) 
+
+    # JAX 和 PyTorch 均使用 TorchDataLoader；下方按框架设置采样器与每进程批量。
+    # PyTorch 分布式训练使用 DistributedSampler 划分样本。
+    # batch_size 为全局批量，local_batch_size 为当前进程的批量。
+    sampler = None  # 默认不使用分布式采样器。
     if framework == "pytorch":
-        if torch.distributed.is_initialized():
+        if torch.distributed.is_initialized():  # 已初始化分布式进程组。
+            # 按全局进程数和当前 rank 分配数据索引，shuffle 也由采样器负责。
             sampler = torch.utils.data.distributed.DistributedSampler(
                 dataset,
                 num_replicas=torch.distributed.get_world_size(),
                 rank=torch.distributed.get_rank(),
                 shuffle=shuffle,
-                drop_last=True,
+                drop_last=True,  # 丢弃无法在各进程间均分的尾部样本。
             )
-            local_batch_size = batch_size // torch.distributed.get_world_size()
+            local_batch_size = batch_size // torch.distributed.get_world_size()  # 全局批量 ÷ 进程数。
         else:
-            local_batch_size = batch_size
+            local_batch_size = batch_size  # 非分布式训练使用完整批量。
     else:
-        local_batch_size = batch_size // jax.process_count()
+        local_batch_size = batch_size // jax.process_count()  # JAX 按进程数划分批量。
 
     logging.info(f"local_batch_size: {local_batch_size}")
+    # 创建批量迭代器；framework 决定后续张量转换和设备处理方式。
     data_loader = TorchDataLoader(
         dataset,
         local_batch_size=local_batch_size,
-        sharding=None if framework == "pytorch" else sharding,
-        shuffle=(sampler is None and shuffle),  # Don't shuffle if using sampler
+        sharding=None if framework == "pytorch" else sharding,  # 仅 JAX 使用此分片设置。
+        shuffle=(sampler is None and shuffle),  # 使用采样器时不再由加载器重复打乱。
         sampler=sampler,
-        num_batches=num_batches,
-        num_workers=num_workers,
-        seed=seed,
+        num_batches=num_batches,  # 返回批次数上限；None 表示不设上限。
+        num_workers=num_workers,  # 数据加载工作进程数；0 表示在当前进程加载。
+        seed=seed,  # 传给加载器的随机种子。
         framework=framework,
     )
 
+
+    '''
+    统一封装加载器；迭代时将批次字典整理为 (Observation, Actions)
+    observation
+    ├── images
+    │   ├── base_0_rgb          [2, 3, 224, 224]
+    │   ├── left_wrist_0_rgb    [2, 3, 224, 224]
+    │   └── right_wrist_0_rgb   [2, 3, 224, 224]
+    ├── image_masks            每路 [2]
+    ├── state                  [2, 32]
+    ├── tokenized_prompt       [2, 48]
+    └── tokenized_prompt_mask  [2, 48]
+
+    actions                    [2, 50, 32]
+
+    '''
     return DataLoaderImpl(data_config, data_loader)
 
 
