@@ -672,6 +672,10 @@ _CONFIGS = [
         # 下方可设置学习率、训练步数等其他超参数。
         # 完整的可用超参数列表见 TrainConfig 基类。
         num_train_steps=30_000,
+        batch_size=32,           # 四卡全局 batch 32，每卡 8
+        log_interval=100,        # 每 100 步记录一次
+        save_interval=3_000,     # 每 3000 步保存一次检查点
+        wandb_enabled=False,
     ),
     TrainConfig(
         name="pi0_libero_low_mem_finetune",
