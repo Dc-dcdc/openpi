@@ -48,7 +48,7 @@ class Policy(BasePolicy):
             is_pytorch: Whether the model is a PyTorch model. If False, assumes JAX model.
         """
         self._model = model
-        self._input_transform = _transforms.compose(transforms)
+        self._input_transform = _transforms.compose(transforms)  # 准备模型输入
         self._output_transform = _transforms.compose(output_transforms)
         self._sample_kwargs = sample_kwargs or {}
         self._metadata = metadata or {}
@@ -87,19 +87,20 @@ class Policy(BasePolicy):
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
 
-        observation = _model.Observation.from_dict(inputs)
+        observation = _model.Observation.from_dict(inputs) # 转换成模型统一使用的 Observation 观测对象
         start_time = time.monotonic()
         outputs = {
-            "state": inputs["state"],
+            "state": inputs["state"],  ## 保留输入状态，供后续动作还原等处理使用
             "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
-        }
+        } # 返回模型输出
+        
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
         else:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
-        outputs = self._output_transform(outputs)
+        outputs = self._output_transform(outputs)  # 整理为环境需要的动作
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }

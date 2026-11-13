@@ -314,8 +314,7 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         # 下面分别定义进入模型的数据变换（inputs）和
         # 模型输出的数据变换（outputs，后者仅在推理时使用）。
         # 这些变换定义在 `libero_policy.py` 中，可参考其中的详细注释，
-        # 了解如何适配自定义数据集。定义好自己的变换后，
-        # 将下面的变换替换为相应实现即可。
+        # 了解如何适配自定义数据集。定义好自己的变换后，将下面的变换替换为相应实现即可。
         data_transforms = _transforms.Group(
             inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
             outputs=[libero_policy.LiberoOutputs()],
@@ -464,7 +463,7 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
 class TrainConfig:
     # 配置名称，必须唯一，用于引用该配置。
     name: tyro.conf.Suppress[str]
-    # 项目名称。
+    # W&B 项目名称。
     project_name: str = "openpi"
     # 实验名称，用于命名元数据和检查点目录。
     exp_name: str = tyro.MISSING
